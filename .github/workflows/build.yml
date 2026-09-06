@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -16,16 +17,38 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && pip install -r requirements.txt pyinstaller
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Syntax check
+        shell: pwsh
+        run: |
+          python -m py_compile main.py tunevault_engine.py
 
       - name: Build executable
-        run: pyinstaller --noconfirm --clean --windowed --name TuneVault --collect-all imageio_ffmpeg --collect-all PySide6 main.py
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed --name TuneVault `
+            --collect-all imageio_ffmpeg `
+            --collect-all PySide6 `
+            --hidden-import=tunevault_engine `
+            main.py
+
+      - name: Verify packaged files
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/TuneVault/TuneVault.exe")) { throw "TuneVault.exe was not produced" }
+          Get-ChildItem -Recurse dist/TuneVault | Select-Object FullName, Length
 
       - name: Package
         shell: pwsh
-        run: Compress-Archive -Path dist/TuneVault/* -DestinationPath TuneVault-Windows.zip
+        run: |
+          Compress-Archive -Path dist/TuneVault/* -DestinationPath TuneVault-Windows.zip -Force
 
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
@@ -33,3 +56,4 @@ jobs:
           name: TuneVault-Windows
           path: TuneVault-Windows.zip
           if-no-files-found: error
+          retention-days: 30
