@@ -1,333 +1,217 @@
 from __future__ import annotations
-
-import json
-import os
-import sys
-import urllib.request
+import json, os, sys, urllib.request
 from pathlib import Path
-
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, Slot
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPushButton, QSplitter, QStackedWidget, QVBoxLayout, QWidget, QInputDialog,
-)
+from PySide6.QtWidgets import QApplication,QComboBox,QDialog,QFileDialog,QFrame,QHBoxLayout,QLabel,QLineEdit,QListWidget,QListWidgetItem,QMainWindow,QMessageBox,QPushButton,QSplitter,QStackedWidget,QVBoxLayout,QWidget,QInputDialog,QProgressBar
+from tunevault_engine import ApplyEngine,LibraryModel,Operation,resolve,safe_name
 
-from tunevault_engine import ApplyEngine, LibraryModel, Operation, resolve, safe_name
-
-APP_NAME = "TuneVault"
-APP_DIR = Path(os.getenv("APPDATA", Path.home())) / APP_NAME
-APP_DIR.mkdir(parents=True, exist_ok=True)
-CONFIG = APP_DIR / "config.json"
-
-
-def load_config() -> dict:
+APP='TuneVault'; APP_DIR=Path(os.getenv('APPDATA',str(Path.home())))/APP; APP_DIR.mkdir(parents=True,exist_ok=True); CONFIG=APP_DIR/'config.json'
+def cfg():
     try:
-        data = json.loads(CONFIG.read_text(encoding="utf-8")) if CONFIG.exists() else {}
-        return data if isinstance(data, dict) else {"roots": []}
-    except (OSError, json.JSONDecodeError):
-        return {"roots": []}
+        x=json.loads(CONFIG.read_text(encoding='utf-8')) if CONFIG.exists() else {}
+        return x if isinstance(x,dict) else {'roots':[]}
+    except Exception:return {'roots':[]}
+def save(x):
+    t=CONFIG.with_suffix('.tmp'); t.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding='utf-8'); t.replace(CONFIG)
+def safe_file_name(name,old_suffix=''):
+    n=safe_name(name).strip(); p=Path(n)
+    if not p.suffix and old_suffix:n+=old_suffix
+    return n
 
-
-def save_config(data: dict) -> None:
-    tmp = CONFIG.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(CONFIG)
-
-
-def fmt_time(seconds) -> str:
-    if not seconds:
-        return ""
-    total = max(0, int(seconds)); h, rem = divmod(total, 3600); m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
-def icon_for(path: Path) -> str:
-    if path.is_dir(): return "FOLDER"
-    if path.suffix.lower() in {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}: return "AUDIO"
-    if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}: return "VIDEO"
-    return "FILE"
-
-
-class Signals(QObject):
-    result = Signal(object); error = Signal(str); done = Signal()
-
-
-class Worker(QRunnable):
-    def __init__(self, fn, *args):
-        super().__init__(); self.fn, self.args = fn, args; self.signals = Signals()
+def icon(p):
+    if p.is_dir():return '📁'
+    if p.suffix.lower() in {'.mp3','.wav','.flac','.m4a','.aac','.ogg','.opus'}:return '🎵'
+    if p.suffix.lower() in {'.mp4','.mkv','.webm','.mov','.avi','.m4v'}:return '🎬'
+    return '📄'
+class Sig(QObject):
+    result=Signal(object); error=Signal(str); done=Signal()
+class Work(QRunnable):
+    def __init__(self,fn,*a):super().__init__();self.fn=fn;self.a=a;self.s=Sig()
     @Slot()
     def run(self):
-        try: self.signals.result.emit(self.fn(*self.args))
-        except Exception as exc: self.signals.error.emit(str(exc))
-        finally: self.signals.done.emit()
-
+        try:self.s.result.emit(self.fn(*self.a))
+        except Exception as e:self.s.error.emit(str(e))
+        finally:self.s.done.emit()
 
 class MediaDialog(QDialog):
-    def __init__(self, target: Path, parent=None):
-        super().__init__(parent); self.target=target; self.info=None; self.entries=[]
-        self.setWindowTitle("TuneVault · Add media"); self.resize(760, 620); box=QVBoxLayout(self)
-        head=QFrame(); head.setObjectName("Panel"); hv=QVBoxLayout(head); t=QLabel("Add media"); t.setObjectName("DialogTitle"); hv.addWidget(t); hv.addWidget(QLabel("Detect a media URL, configure it, then stage it. Nothing is downloaded until Save Changes.")); box.addWidget(head)
-        urlrow=QHBoxLayout(); self.url=QLineEdit(); self.url.setPlaceholderText("Paste a media or playlist URL…"); self.detect=QPushButton("Detect"); self.detect.setObjectName("Primary"); urlrow.addWidget(self.url,1); urlrow.addWidget(self.detect); box.addLayout(urlrow)
-        preview=QFrame(); preview.setObjectName("Panel"); pv=QHBoxLayout(preview); self.thumb=QLabel("NO\nPREVIEW"); self.thumb.setAlignment(Qt.AlignCenter); self.thumb.setObjectName("Thumb"); self.thumb.setFixedSize(200,112); pv.addWidget(self.thumb)
-        meta=QVBoxLayout(); self.preview_title=QLabel("No media detected"); self.preview_title.setObjectName("MediaTitle"); self.preview_meta=QLabel("Paste a URL and press Detect"); self.preview_meta.setObjectName("Muted"); self.preview_kind=QLabel(""); self.preview_kind.setObjectName("Muted"); meta.addWidget(self.preview_title); meta.addWidget(self.preview_meta); meta.addWidget(self.preview_kind); meta.addStretch(); pv.addLayout(meta,1); box.addWidget(preview)
-        self.mode=QComboBox(); self.mode.addItems(["Single","Playlist"]); self.mode.setEnabled(False); self.name=QLineEdit(); self.name.setPlaceholderText("File name"); self.name.setEnabled(False); self.format=QComboBox(); self.format.addItems(["MP3","MP4"]); self.format.setEnabled(False)
-        box.addWidget(QLabel("Mode")); box.addWidget(self.mode); box.addWidget(QLabel("Name")); box.addWidget(self.name); fr=QHBoxLayout(); fr.addWidget(QLabel("Format")); fr.addWidget(self.format,1); box.addLayout(fr)
-        self.batch=QListWidget(); self.batch.setVisible(False); box.addWidget(self.batch,1)
-        buttons=QHBoxLayout(); buttons.addStretch(); cancel=QPushButton("Cancel"); add=QPushButton("Stage media"); add.setObjectName("Primary"); add.setEnabled(False); buttons.addWidget(cancel); buttons.addWidget(add); box.addLayout(buttons); self.add_btn=add
-        self.detect.clicked.connect(self.detect_media); self.mode.currentIndexChanged.connect(self.mode_changed); cancel.clicked.connect(self.reject); add.clicked.connect(self.accept)
-
-    def detect_media(self):
-        url=self.url.text().strip()
-        if not url:return
-        self.detect.setEnabled(False); self.detect.setText("Detecting…"); w=Worker(self.extract,url); w.signals.result.connect(self.detected); w.signals.error.connect(lambda e:QMessageBox.warning(self,"Detection failed",e)); w.signals.done.connect(lambda:(self.detect.setEnabled(True),self.detect.setText("Detect"))); QThreadPool.globalInstance().start(w)
-
+    def __init__(self,target,parent=None):
+        super().__init__(parent);self.target=target;self.info={};self.entries=[];self.setWindowTitle('הוספת מדיה · TuneVault');self.resize(780,650);l=QVBoxLayout(self)
+        h=QLabel('הוספת מדיה');h.setObjectName('DialogTitle');l.addWidget(h);s=QLabel('הדבק קישור. בחר שם ופורמט. ההורדה עצמה תתחיל רק אחרי «שמירת שינויים».');s.setObjectName('Muted');l.addWidget(s)
+        r=QHBoxLayout();self.url=QLineEdit();self.url.setPlaceholderText('קישור YouTube / מדיה / פלייליסט…');b=QPushButton('זיהוי');b.setObjectName('Primary');b.clicked.connect(self.detect);r.addWidget(self.url,1);r.addWidget(b);l.addLayout(r);self.detect_btn=b
+        panel=QFrame();panel.setObjectName('Panel');pv=QHBoxLayout(panel);self.thumb=QLabel('תצוגה מקדימה');self.thumb.setAlignment(Qt.AlignCenter);self.thumb.setFixedSize(210,118);self.thumb.setObjectName('Thumb');pv.addWidget(self.thumb);m=QVBoxLayout();self.title=QLabel('לא זוהתה מדיה');self.title.setObjectName('MediaTitle');self.meta=QLabel('');self.meta.setObjectName('Muted');m.addWidget(self.title);m.addWidget(self.meta);m.addStretch();pv.addLayout(m,1);l.addWidget(panel)
+        self.name=QLineEdit();self.name.setPlaceholderText('שם הקובץ');self.name.setEnabled(False);self.format=QComboBox();self.format.addItems(['MP3','MP4']);self.format.setEnabled(False);l.addWidget(QLabel('שם השיר / הקובץ'));l.addWidget(self.name);fr=QHBoxLayout();fr.addWidget(QLabel('פורמט'));fr.addWidget(self.format,1);l.addLayout(fr)
+        self.list=QListWidget();self.list.hide();l.addWidget(self.list,1);ar=QHBoxLayout();ar.addStretch();c=QPushButton('ביטול');ok=QPushButton('הוסף לתור');ok.setObjectName('Primary');c.clicked.connect(self.reject);ok.clicked.connect(self.accept);ar.addWidget(c);ar.addWidget(ok);l.addLayout(ar);self.ok=ok
+        b.clicked.connect(self.detect)
+    def detect(self):
+        u=self.url.text().strip()
+        if not u:return
+        self.detect_btn.setEnabled(False);self.detect_btn.setText('מזהה…');w=Work(self.extract,u);w.s.result.connect(self.detected);w.s.error.connect(lambda e:QMessageBox.warning(self,'שגיאת זיהוי','לא ניתן לזהות את הקישור.\n\n'+e));w.s.done.connect(lambda:(self.detect_btn.setEnabled(True),self.detect_btn.setText('זיהוי')));QThreadPool.globalInstance().start(w)
     @staticmethod
-    def extract(url):
+    def extract(u):
         import yt_dlp
-        with yt_dlp.YoutubeDL({"quiet":True,"no_warnings":True,"skip_download":True,"noplaylist":False}) as ydl:return ydl.extract_info(url,download=False)
-
-    def detected(self,info):
-        self.info=info or {}; self.entries=[e for e in (self.info.get("entries") or []) if e]; title=self.info.get("title") or "Untitled media"; creator=self.info.get("uploader") or self.info.get("channel") or ""; dur=fmt_time(self.info.get("duration")); playlist=len(self.entries)>1
-        self.preview_title.setText(title); self.preview_meta.setText(" · ".join(x for x in (creator,dur) if x)); self.preview_kind.setText(f"Playlist · {len(self.entries)} items" if playlist else "Single media"); self.mode.setEnabled(playlist); self.mode.setCurrentIndex(1 if playlist else 0); self.name.setText(title); self.name.setEnabled(True); self.format.setEnabled(True); self.add_btn.setEnabled(True); self.batch.clear()
-        for e in self.entries:self.batch.addItem(QListWidgetItem(e.get("title") or "Untitled"))
-        self.mode_changed(self.mode.currentIndex()); thumb=self.info.get("thumbnail")
+        with yt_dlp.YoutubeDL({'quiet':True,'no_warnings':True,'skip_download':True,'noplaylist':False}) as y:return y.extract_info(u,download=False)
+    def detected(self,x):
+        self.info=x or {};self.entries=[e for e in (self.info.get('entries') or []) if e];title=self.info.get('title') or 'ללא שם'; creator=self.info.get('uploader') or self.info.get('channel') or ''; self.title.setText(title);self.meta.setText((' · '.join(v for v in [creator,self.info.get('webpage_url') and 'מדיה' or ''] if v)) or 'מדיה');self.name.setText(title);self.name.setEnabled(True);self.format.setEnabled(True);self.ok.setEnabled(True)
+        if len(self.entries)>1:
+            self.list.show();self.list.clear();self.list.addItem(f'פלייליסט · {len(self.entries)} פריטים')
+            for e in self.entries:self.list.addItem(e.get('title') or 'ללא שם')
+        thumb=self.info.get('thumbnail')
         if thumb:
-            w=Worker(self.get_thumb,thumb); w.signals.result.connect(self.show_thumb); QThreadPool.globalInstance().start(w)
-
+            w=Work(self.thumb_data,thumb);w.s.result.connect(self.show_thumb);QThreadPool.globalInstance().start(w)
     @staticmethod
-    def get_thumb(url):
-        with urllib.request.urlopen(url,timeout=12) as r:return r.read()
-
-    def show_thumb(self,data):
-        pix=QPixmap();
-        if pix.loadFromData(data): self.thumb.setText(""); self.thumb.setPixmap(pix.scaled(self.thumb.size(),Qt.KeepAspectRatio,Qt.SmoothTransformation))
-
-    def mode_changed(self,index):
-        playlist=index==1 and bool(self.entries); self.batch.setVisible(playlist); self.name.setVisible(not playlist); self.format.setVisible(not playlist)
-
+    def thumb_data(u):
+        with urllib.request.urlopen(u,timeout=10) as r:return r.read()
+    def show_thumb(self,d):
+        p=QPixmap();
+        if p.loadFromData(d):self.thumb.setPixmap(p.scaled(self.thumb.size(),Qt.KeepAspectRatio,Qt.SmoothTransformation));self.thumb.setText('')
     def payloads(self):
-        if self.mode.currentIndex()==1 and self.entries:
-            return [{"url":e.get("webpage_url") or e.get("original_url"),"title":e.get("title") or "Untitled","format":"MP3","target":str(self.target)} for e in self.entries if e.get("webpage_url") or e.get("original_url")]
-        return [{"url":self.url.text().strip(),"title":self.name.text().strip() or "Untitled","format":self.format.currentText(),"target":str(self.target)}]
-
+        if len(self.entries)>1:
+            return [{'url':e.get('webpage_url') or e.get('original_url'),'title':e.get('title') or 'ללא שם','format':'MP3','target':str(self.target)} for e in self.entries if e.get('webpage_url') or e.get('original_url')]
+        return [{'url':self.url.text().strip(),'title':self.name.text().strip() or 'ללא שם','format':self.format.currentText(),'target':str(self.target)}]
 
 class PlaylistDialog(QDialog):
-    def __init__(self,payloads,parent=None):
-        super().__init__(parent); self.payloads=payloads; self.setWindowTitle("TuneVault · Playlist"); self.resize(820,650); l=QVBoxLayout(self); t=QLabel("Playlist options"); t.setObjectName("DialogTitle"); l.addWidget(t); l.addWidget(QLabel(f"{len(payloads)} items are ready.")); quick=QHBoxLayout()
-        for label,fmt in (("All MP3","MP3"),("All MP4","MP4")):
-            b=QPushButton(label); b.clicked.connect(lambda _,f=fmt:self.set_all(f)); quick.addWidget(b)
-        quick.addStretch(); l.addLayout(quick); self.rows=QListWidget(); l.addWidget(self.rows,1)
-        for p in payloads:
-            row=QListWidgetItem(); w=QWidget(); r=QHBoxLayout(w); r.setContentsMargins(10,6,10,6); text=QLabel(p["title"]); combo=QComboBox(); combo.addItems(["MP3","MP4"]); combo.currentTextChanged.connect(lambda v,item=p:item.__setitem__("format",v)); r.addWidget(text,1); r.addWidget(combo); self.rows.addItem(row); self.rows.setItemWidget(row,w)
-        actions=QHBoxLayout(); actions.addStretch(); c=QPushButton("Cancel"); ok=QPushButton("Stage playlist"); ok.setObjectName("Primary"); c.clicked.connect(self.reject); ok.clicked.connect(self.accept); actions.addWidget(c); actions.addWidget(ok); l.addLayout(actions)
+    def __init__(self,items,parent=None):
+        super().__init__(parent);self.items=items;self.setWindowTitle('אפשרויות פלייליסט');self.resize(760,560);l=QVBoxLayout(self);t=QLabel(f'פלייליסט · {len(items)} שירים');t.setObjectName('DialogTitle');l.addWidget(t);q=QHBoxLayout()
+        for text,fmt in [('הכול MP3','MP3'),('הכול MP4','MP4')]:
+            b=QPushButton(text);b.clicked.connect(lambda _,f=fmt:self.all(f));q.addWidget(b)
+        q.addStretch();l.addLayout(q);self.rows=QListWidget();l.addWidget(self.rows,1)
+        for x in items:
+            it=QListWidgetItem();w=QWidget();r=QHBoxLayout(w);r.setContentsMargins(8,4,8,4);r.addWidget(QLabel(x['title']),1);c=QComboBox();c.addItems(['MP3','MP4']);c.currentTextChanged.connect(lambda v,x=x:x.__setitem__('format',v));r.addWidget(c);self.rows.addItem(it);self.rows.setItemWidget(it,w)
+        a=QHBoxLayout();a.addStretch();c=QPushButton('ביטול');o=QPushButton('הוסף לתור');o.setObjectName('Primary');c.clicked.connect(self.reject);o.clicked.connect(self.accept);a.addWidget(c);a.addWidget(o);l.addLayout(a)
+    def all(self,f):
+        for i,x in enumerate(self.items):
+            x['format']=f; w=self.rows.itemWidget(self.rows.item(i)); w.findChild(QComboBox).setCurrentText(f)
 
-    def set_all(self,fmt):
-        for i,p in enumerate(self.payloads):
-            p["format"]=fmt; combo=self.rows.itemWidget(self.rows.item(i)).findChild(QComboBox)
-            if combo:combo.setCurrentText(fmt)
-
-
-class MainWindow(QMainWindow):
+class Main(QMainWindow):
     def __init__(self):
-        super().__init__(); self.config=load_config(); self.model=LibraryModel(self.config.get("roots",[])); self.current_path=None; self.pool=QThreadPool.globalInstance(); self.applying=False; self.setWindowTitle(APP_NAME); self.resize(1440,900); self.setMinimumSize(1180,760); self.build(); self.refresh_roots(); self.timer=QTimer(self); self.timer.timeout.connect(self.external_refresh); self.timer.start(5000)
-
+        super().__init__();self.c=cfg();self.model=LibraryModel(self.c.get('roots',[]));self.current=None;self.pool=QThreadPool.globalInstance();self.engine=None;self.setWindowTitle('TuneVault');self.resize(1450,900);self.build();self.refresh()
     def build(self):
-        central=QWidget(); self.setCentralWidget(central); root=QHBoxLayout(central); root.setContentsMargins(0,0,0,0); root.setSpacing(0); nav=QFrame(); nav.setObjectName("Sidebar"); nav.setFixedWidth(250); nv=QVBoxLayout(nav); nv.setContentsMargins(22,28,22,22); brand=QLabel("TuneVault"); brand.setObjectName("Brand"); nv.addWidget(brand); sub=QLabel("Your media. Your folders. Your computer."); sub.setObjectName("Muted"); sub.setWordWrap(True); nv.addWidget(sub); nv.addSpacing(26)
-        for label,idx in (("Library",0),("Downloads",1),("Search",2)):
-            b=QPushButton(label); b.setObjectName("NavButton"); b.clicked.connect(lambda _,i=idx:self.pages.setCurrentIndex(i)); nv.addWidget(b)
-        nv.addStretch(); self.sidebar_status=QLabel("READY"); self.sidebar_status.setObjectName("StatusPill"); nv.addWidget(self.sidebar_status); root.addWidget(nav); self.pages=QStackedWidget(); root.addWidget(self.pages,1); self.pages.addWidget(self.library_page()); self.pages.addWidget(self.downloads_page()); self.pages.addWidget(self.search_page())
-
-    def header(self,title,subtitle):
-        box=QVBoxLayout(); t=QLabel(title); t.setObjectName("PageTitle"); s=QLabel(subtitle); s.setObjectName("Muted"); box.addWidget(t); box.addWidget(s); return box
-
-    def library_page(self):
-        page=QWidget(); l=QVBoxLayout(page); l.setContentsMargins(34,28,34,28); top=self.header("Library","A focused media workspace. Edits are staged and committed only when you save."); head=QHBoxLayout(); head.addLayout(top,1); self.folder_search=QLineEdit(); self.folder_search.setPlaceholderText("Filter current folder…"); self.folder_search.textChanged.connect(self.render_items); head.addWidget(self.folder_search); add=QPushButton("＋ Add library"); add.setObjectName("Primary"); add.clicked.connect(self.add_root); head.addWidget(add); l.addLayout(head); split=QSplitter(Qt.Horizontal); l.addWidget(split,1)
-        left=QWidget(); lv=QVBoxLayout(left); lv.setContentsMargins(0,0,0,0); ll=QLabel("LIBRARIES"); ll.setObjectName("Eyebrow"); lv.addWidget(ll); self.roots_list=QListWidget(); lv.addWidget(self.roots_list,1); remove=QPushButton("Remove access"); remove.clicked.connect(self.remove_root); lv.addWidget(remove); split.addWidget(left)
-        right=QWidget(); rv=QVBoxLayout(right); rv.setContentsMargins(18,0,0,0); bar=QHBoxLayout(); self.path_label=QLabel("Select a library"); self.path_label.setObjectName("SectionTitle"); bar.addWidget(self.path_label,1)
-        for label,fn in (("↑ Up",self.go_up),("↻ Refresh",self.render_items)):
-            b=QPushButton(label); b.clicked.connect(fn); bar.addWidget(b)
-        rv.addLayout(bar); self.items=QListWidget(); self.items.itemDoubleClicked.connect(self.open_item); rv.addWidget(self.items,1); acts=QHBoxLayout()
-        for label,fn in (("＋ Folder",self.add_folder),("＋ Media",self.add_media),("Rename",self.rename_item),("Move",self.move_item),("Delete",self.delete_item)):
-            b=QPushButton(label); b.clicked.connect(fn); acts.addWidget(b)
-        acts.addStretch(); self.save_button=QPushButton("Save Changes"); self.save_button.setObjectName("Primary"); self.save_button.clicked.connect(self.save_changes); acts.addWidget(self.save_button); rv.addLayout(acts); split.addWidget(right); split.setSizes([320,980]); self.roots_list.currentItemChanged.connect(self.root_selected); return page
-
-    def downloads_page(self):
-        page=QWidget(); l=QVBoxLayout(page); l.setContentsMargins(34,28,34,28); l.addLayout(self.header("Activity","Every staged and completed action is visible here.")); cards=QHBoxLayout(); self.staged=QLabel("0 STAGED"); self.done=QLabel("0 SUCCEEDED"); self.failed=QLabel("0 FAILED")
-        for c in (self.staged,self.done,self.failed): c.setObjectName("StatCard"); cards.addWidget(c)
-        l.addLayout(cards); self.queue=QListWidget(); l.addWidget(self.queue,1); row=QHBoxLayout(); undo=QPushButton("Undo last"); undo.clicked.connect(self.undo_last); retry=QPushButton("Retry failed"); retry.clicked.connect(self.retry_failed); row.addWidget(undo); row.addWidget(retry); row.addStretch(); l.addLayout(row); return page
-
-    def search_page(self):
-        page=QWidget(); l=QVBoxLayout(page); l.setContentsMargins(34,28,34,28); l.addLayout(self.header("Search","Search across every library you have explicitly granted.")); row=QHBoxLayout(); self.global_search=QLineEdit(); self.global_search.setPlaceholderText("Search all libraries…"); go=QPushButton("Search"); go.setObjectName("Primary"); go.clicked.connect(self.run_search); row.addWidget(self.global_search,1); row.addWidget(go); l.addLayout(row); self.results=QListWidget(); self.results.itemDoubleClicked.connect(self.open_search); l.addWidget(self.results,1); return page
-
-    def refresh_roots(self):
-        self.roots_list.clear(); valid=[]
-        for root in self.config.get("roots",[]):
-            p=resolve(root)
-            if p.exists() and p.is_dir(): valid.append(str(p)); it=QListWidgetItem(p.name or str(p)); it.setData(Qt.UserRole,str(p)); self.roots_list.addItem(it)
-        self.config["roots"]=valid; save_config(self.config); self.model.roots=valid
-        if self.roots_list.count() and self.roots_list.currentRow()<0:self.roots_list.setCurrentRow(0)
-        elif not self.roots_list.count():self.current_path=None; self.path_label.setText("Add a library to begin"); self.items.clear()
-
+        root=QHBoxLayout();cen=QWidget();cen.setLayout(root);self.setCentralWidget(cen);side=QFrame();side.setObjectName('Sidebar');side.setFixedWidth(245);sl=QVBoxLayout(side);brand=QLabel('TuneVault');brand.setObjectName('Brand');sl.addWidget(brand);tag=QLabel('המדיה שלך. הסדר שלך. המחשב שלך.');tag.setObjectName('Muted');tag.setWordWrap(True);sl.addWidget(tag);sl.addSpacing(25)
+        self.pages=QStackedWidget();
+        for text,i in [('ספרייה',0),('הורדות',1),('חיפוש',2)]:
+            b=QPushButton(text);b.setObjectName('NavButton');b.clicked.connect(lambda _,i=i:self.pages.setCurrentIndex(i));sl.addWidget(b)
+        sl.addStretch();self.status=QLabel('מוכן');self.status.setObjectName('StatusPill');sl.addWidget(self.status);root.addWidget(side);root.addWidget(self.pages,1);self.pages.addWidget(self.library());self.pages.addWidget(self.downloads());self.pages.addWidget(self.search())
+    def library(self):
+        p=QWidget();l=QVBoxLayout(p);head=QHBoxLayout();v=QVBoxLayout();t=QLabel('ספרייה');t.setObjectName('PageTitle');v.addWidget(t);sub=QLabel('ניהול מקומי. שום שינוי בדיסק לא מתבצע לפני «שמירת שינויים».');sub.setObjectName('Muted');v.addWidget(sub);head.addLayout(v,1);self.filter=QLineEdit();self.filter.setPlaceholderText('חיפוש בתיקייה…');self.filter.textChanged.connect(self.render);head.addWidget(self.filter);a=QPushButton('+ תיקייה');a.setObjectName('Primary');a.clicked.connect(self.add_root);head.addWidget(a);l.addLayout(head);sp=QSplitter();left=QWidget();ll=QVBoxLayout(left);ll.addWidget(QLabel('מיקומים מורשים'));self.roots=QListWidget();ll.addWidget(self.roots,1);rm=QPushButton('הסר גישה');rm.clicked.connect(self.remove_root);ll.addWidget(rm);sp.addWidget(left);right=QWidget();rl=QVBoxLayout(right);bar=QHBoxLayout();self.path=QLabel('בחר תיקייה');self.path.setObjectName('SectionTitle');bar.addWidget(self.path,1);up=QPushButton('↑ אחורה');up.clicked.connect(self.up);rf=QPushButton('↻ רענן');rf.clicked.connect(self.render);bar.addWidget(up);bar.addWidget(rf);rl.addLayout(bar);self.items=QListWidget();self.items.itemDoubleClicked.connect(self.open);rl.addWidget(self.items,1);acts=QHBoxLayout();
+        for txt,fn in [('+ תיקייה',self.mkdir),('+ הוסף שיר',self.media),('שנה שם',self.rename),('העבר',self.move),('מחק',self.delete)]:b=QPushButton(txt);b.clicked.connect(fn);acts.addWidget(b)
+        acts.addStretch();self.saveb=QPushButton('שמירת שינויים');self.saveb.setObjectName('Primary');self.saveb.clicked.connect(self.save_changes);acts.addWidget(self.saveb);rl.addLayout(acts);sp.addWidget(right);sp.setSizes([320,1000]);l.addWidget(sp,1);self.roots.currentItemChanged.connect(lambda x,_:self.select_root(x));return p
+    def downloads(self):
+        p=QWidget();l=QVBoxLayout(p);t=QLabel('הורדות');t.setObjectName('PageTitle');l.addWidget(t);s=QLabel('תור ההורדות ופעולות אחרונות');s.setObjectName('Muted');l.addWidget(s);self.progress=QProgressBar();self.progress.setTextVisible(True);self.progress.setValue(0);l.addWidget(self.progress);self.queue=QListWidget();l.addWidget(self.queue,1);r=QHBoxLayout();u=QPushButton('בטל שינוי אחרון');u.clicked.connect(self.undo);r.addWidget(u);r.addStretch();l.addLayout(r);return p
+    def search(self):
+        p=QWidget();l=QVBoxLayout(p);t=QLabel('חיפוש');t.setObjectName('PageTitle');l.addWidget(t);self.g=QLineEdit();self.g.setPlaceholderText('חפש בכל הספריות…');b=QPushButton('חיפוש');b.setObjectName('Primary');b.clicked.connect(self.search_go);r=QHBoxLayout();r.addWidget(self.g,1);r.addWidget(b);l.addLayout(r);self.results=QListWidget();self.results.itemDoubleClicked.connect(self.search_open);l.addWidget(self.results,1);return p
+    def refresh(self):
+        self.roots.clear();valid=[]
+        for x in self.c.get('roots',[]):
+            p=resolve(x)
+            if p.exists() and p.is_dir():valid.append(str(p));it=QListWidgetItem('📁 '+(p.name or str(p)));it.setData(Qt.UserRole,str(p));self.roots.addItem(it)
+        self.c['roots']=valid;save(self.c);self.model.roots=valid
+        if self.roots.count():self.roots.setCurrentRow(0)
+        else:self.current=None;self.path.setText('הוסף תיקייה כדי להתחיל');self.items.clear()
     def add_root(self):
-        path=QFileDialog.getExistingDirectory(self,"Choose library folder")
-        if not path:return
-        p=resolve(path); roots=[resolve(x) for x in self.config.get("roots",[])]
-        overlap=any(p==r or p.is_relative_to(r) or r.is_relative_to(p) for r in roots)
-        if overlap:QMessageBox.information(self,"Already accessible","This folder overlaps an existing library."); return
-        self.config["roots"].append(str(p)); save_config(self.config); self.model.roots=self.config["roots"]; self.refresh_roots()
-
+        x=QFileDialog.getExistingDirectory(self,'בחר תיקייה');
+        if not x:return
+        p=resolve(x);rs=[resolve(z) for z in self.c.get('roots',[])]
+        if any(p==r or p.is_relative_to(r) or r.is_relative_to(p) for r in rs):QMessageBox.information(self,'כבר קיימת','התיקייה כבר נמצאת בתוך אזור מורשה.');return
+        self.c['roots'].append(str(p));save(self.c);self.model.roots=self.c['roots'];self.refresh()
     def remove_root(self):
-        it=self.roots_list.currentItem()
+        it=self.roots.currentItem();
         if not it:return
         p=resolve(it.data(Qt.UserRole))
-        if QMessageBox.question(self,"Remove access",f"Remove {p.name} from TuneVault?\n\nNo files will be deleted.")==QMessageBox.Yes:self.config["roots"]=[r for r in self.config.get("roots",[]) if resolve(r)!=p]; save_config(self.config); self.model.roots=self.config["roots"]; self.refresh_roots()
-
-    def root_selected(self,current,_prev=None):
-        if current:self.current_path=resolve(current.data(Qt.UserRole)); self.render_items()
-
-    def virtual_name_conflict(self,path):
-        folder=resolve(Path(path).parent); name=resolve(path).name.lower(); return any(p.name.lower()==name for p,_ in self.model.virtual_entries(folder))
-
-    def render_items(self,*_):
-        if not self.current_path:return
-        self.path_label.setText(str(self.current_path)); needle=self.folder_search.text().strip().lower(); self.items.clear()
-        for p,state in self.model.virtual_entries(self.current_path):
-            if needle and needle not in p.name.lower():continue
-            marker={"pending":"• ","delete":"✕ "}.get(state,""); it=QListWidgetItem(f"{marker}{p.name}"); it.setData(Qt.UserRole,str(p)); it.setToolTip(f"{icon_for(p)} · {p}"); self.items.addItem(it)
-        self.update_activity()
-
-    def open_item(self,item):
-        p=resolve(item.data(Qt.UserRole))
-        if p.is_dir():self.current_path=p; self.render_items()
-
-    def go_up(self):
-        if not self.current_path:return
-        roots=[resolve(r) for r in self.config.get("roots",[])]
-        if self.current_path not in roots:self.current_path=self.current_path.parent; self.render_items()
-
-    def add_folder(self):
-        if not self.current_path:return
-        name,ok=QInputDialog.getText(self,"New folder","Folder name")
-        if not ok:return
-        target=resolve(self.current_path/safe_name(name))
-        if self.virtual_name_conflict(target):QMessageBox.warning(self,"Folder exists","Choose a different name."); return
-        self.model.stage(Operation("mkdir",f"Create folder · {target.name}",path=str(target))); self.render_items(); self.set_dirty()
-
-    def add_media(self):
-        if not self.current_path:return
-        d=MediaDialog(self.current_path,self)
+        if QMessageBox.question(self,'הסר גישה',f'להסיר את {p.name} מהספרייה?\nהקבצים לא יימחקו.')==QMessageBox.Yes:self.c['roots']=[x for x in self.c['roots'] if resolve(x)!=p];save(self.c);self.refresh()
+    def select_root(self,it):
+        if it:self.current=resolve(it.data(Qt.UserRole));self.render()
+    def render(self,*_):
+        if not self.current:return
+        self.path.setText(str(self.current));self.items.clear();q=self.filter.text().lower().strip()
+        for p,state in self.model.virtual_entries(self.current):
+            if q and q not in p.name.lower():continue
+            mark='  • בהמתנה' if state=='pending' else ''
+            it=QListWidgetItem(f'{icon(p)}  {p.name}{mark}');it.setData(Qt.UserRole,str(p));self.items.addItem(it)
+        self.activity()
+    def open(self,it):
+        p=resolve(it.data(Qt.UserRole));
+        if p.is_dir():self.current=p;self.render()
+    def up(self):
+        if self.current and self.current not in [resolve(x) for x in self.c['roots']]:self.current=self.current.parent;self.render()
+    def mkdir(self):
+        if not self.current:return
+        n,ok=QInputDialog.getText(self,'תיקייה חדשה','שם התיקייה:');
+        if ok and n:self.model.stage(Operation('mkdir',f'יצירת תיקייה · {n}',path=str(self.current/safe_name(n))));self.dirty()
+    def media(self):
+        if not self.current:return
+        d=MediaDialog(self.current,self)
         if d.exec()!=QDialog.Accepted:return
-        payloads=d.payloads()
-        if len(payloads)>1:
-            p=PlaylistDialog(payloads,self)
-            if p.exec()!=QDialog.Accepted:return
-        for payload in payloads:self.model.stage(Operation("download",f"Download · {payload['title']} [{payload['format']}]",payload=payload))
-        self.set_dirty(); self.pages.setCurrentIndex(1)
-
-    def selected_path(self):
-        it=self.items.currentItem(); return resolve(it.data(Qt.UserRole)) if it else None
-
-    def rename_item(self):
-        old=self.selected_path()
+        ps=d.payloads()
+        if len(ps)>1:
+            q=PlaylistDialog(ps,self)
+            if q.exec()!=QDialog.Accepted:return
+        for x in ps:self.model.stage(Operation('download',f'הורדה · {x["title"]} [{x["format"]}]',payload=x))
+        self.dirty();self.pages.setCurrentIndex(1);self.render()
+    def selected(self):
+        i=self.items.currentItem();return resolve(i.data(Qt.UserRole)) if i else None
+    def rename(self):
+        old=self.selected();
         if not old:return
-        name,ok=QInputDialog.getText(self,"Rename","New name",text=old.name)
+        n,ok=QInputDialog.getText(self,'שינוי שם','שם חדש:',text=old.stem)
         if not ok:return
-        new=resolve(old.parent/safe_name(name))
+        new=old.parent/safe_file_name(n,old.suffix)
         if new==old:return
-        if self.virtual_name_conflict(new):QMessageBox.warning(self,"Name in use","That name already exists in this folder."); return
-        self.model.stage(Operation("rename",f"Rename · {old.name} → {new.name}",old=str(old),new=str(new))); self.render_items(); self.set_dirty()
-
-    def move_item(self):
-        old=self.selected_path()
+        if any(resolve(p)==new for p,_ in self.model.virtual_entries(old.parent)):QMessageBox.warning(self,'שם קיים','כבר קיים פריט בשם הזה.');return
+        self.model.stage(Operation('rename',f'שינוי שם · {old.name} → {new.name}',old=str(old),new=str(new)));self.dirty()
+    def move(self):
+        old=self.selected();
         if not old:return
-        dest=QFileDialog.getExistingDirectory(self,"Choose destination folder",str(old.parent))
-        if not dest:return
-        dest=resolve(dest); new=dest/old.name
-        if not self.model.allowed(dest) or self.virtual_name_conflict(new):QMessageBox.warning(self,"Move blocked","Choose an accessible destination without a conflicting name."); return
-        self.model.stage(Operation("move",f"Move · {old.name} → {dest}",old=str(old),new=str(new))); self.render_items(); self.set_dirty()
-
-    def delete_item(self):
-        p=self.selected_path()
-        if not p:return
-        if QMessageBox.question(self,"Stage deletion",f"Stage deletion of {p.name}?\n\nNothing is removed until Save Changes.")==QMessageBox.Yes:self.model.stage(Operation("delete",f"Delete · {p.name}",path=str(p))); self.render_items(); self.set_dirty()
-
-    def set_dirty(self):
-        self.sidebar_status.setText(f"UNSAVED · {len(self.model.pending)}"); self.save_button.setEnabled(True); self.save_button.setText(f"Save Changes ({len(self.model.pending)})"); self.update_activity()
-
+        d=QFileDialog.getExistingDirectory(self,'בחר יעד',str(old.parent));
+        if not d:return
+        new=resolve(d)/old.name
+        if not self.model.allowed(new):QMessageBox.warning(self,'פעולה חסומה','היעד חייב להיות בתוך תיקייה מורשית.');return
+        self.model.stage(Operation('move',f'העברה · {old.name}',old=str(old),new=str(new)));self.dirty()
+    def delete(self):
+        p=self.selected();
+        if p and QMessageBox.question(self,'מחיקה','לסמן למחיקה?\nהקובץ לא יימחק עד שמירת שינויים.')==QMessageBox.Yes:self.model.stage(Operation('delete',f'מחיקה · {p.name}',path=str(p)));self.dirty()
+    def dirty(self):
+        self.status.setText(f'יש {len(self.model.pending)} שינויים ממתינים');self.saveb.setText(f'שמירת שינויים ({len(self.model.pending)})');self.saveb.setEnabled(True);self.render();self.activity()
     def save_changes(self):
-        if not self.model.pending or self.applying:return
-        self.applying=True; self.save_button.setEnabled(False); self.save_button.setText("Saving…"); engine=ApplyEngine(self.model); self.current_engine=engine; w=Worker(engine.apply); w.signals.result.connect(self.save_result); w.signals.error.connect(self.save_error); self.pool.start(w)
-
-    def save_result(self,results):
-        for op in results:
-            if op.status=="success":self.model.history.append(op); self.model.pending.remove(op)
-        self.model.pending=[op for op in self.model.pending if op.status not in {"cancelled"}]; self.applying=False; self.save_button.setEnabled(bool(self.model.pending)); self.save_button.setText("Save Changes" if not self.model.pending else f"Save Changes ({len(self.model.pending)})"); self.sidebar_status.setText("SAVED" if not self.model.pending else f"UNSAVED · {len(self.model.pending)}"); self.render_items(); self.update_activity()
-
-    def save_error(self,error):
-        self.applying=False; self.save_button.setEnabled(True); self.save_button.setText("Save Changes"); self.sidebar_status.setText("ERROR"); QMessageBox.critical(self,"Save engine error",error)
-
-    def undo_last(self):
-        op=self.model.undo_last()
-        if op:self.sidebar_status.setText("UNDO"); self.render_items(); self.update_activity()
-
-    def retry_failed(self):
-        changed=False
-        for op in self.model.pending:
-            if op.status=="failed":op.status="pending"; op.error=""; changed=True
-        if changed:self.set_dirty()
-        self.save_changes()
-
-    def update_activity(self):
-        if not hasattr(self,"queue"):return
+        if not self.model.pending:return
+        self.saveb.setEnabled(False);self.saveb.setText('מבצע שינויים…');self.progress.setValue(0);self.engine=ApplyEngine(self.model);w=Work(self.engine.apply);w.s.result.connect(self.saved);w.s.error.connect(lambda e:QMessageBox.critical(self,'שגיאה',e));w.s.done.connect(lambda:None);self.pool.start(w)
+    def saved(self,res):
+        for op in res:
+            if op.status=='success':self.model.history.append(op)
+        self.model.pending=[x for x in self.model.pending if x.status not in {'success','cancelled'}];failed=[x for x in res if x.status=='failed']
+        self.saveb.setEnabled(bool(self.model.pending));self.saveb.setText('שמירת שינויים' if not self.model.pending else f'שמירת שינויים ({len(self.model.pending)})');self.status.setText('נשמר בהצלחה' if not failed else f'{len(failed)} פעולות נכשלו');self.progress.setValue(100 if not failed else 50);self.render();self.activity()
+        if failed:QMessageBox.warning(self,'חלק מההורדות נכשלו','הפעולות שנכשלו נשארו בתור כדי שאפשר יהיה לנסות שוב.\n\n'+ '\n'.join(x.error for x in failed[:5]))
+    def undo(self):
+        if self.model.undo_last():self.dirty()
+    def activity(self):
+        if not hasattr(self,'queue'):return
         self.queue.clear()
-        for op in self.model.pending:
-            marker="✕" if op.status=="failed" else "•"; err=f" — {op.error}" if op.error else ""; self.queue.addItem(QListWidgetItem(f"{marker}  {op.label}{err}"))
-        for op in reversed(self.model.history[-80:]):self.queue.addItem(QListWidgetItem(f"✓  {op.label}"))
-        self.staged.setText(f"{sum(1 for x in self.model.pending if x.status=='pending')} STAGED"); self.done.setText(f"{sum(1 for x in self.model.history if x.status=='success')} SUCCEEDED"); self.failed.setText(f"{sum(1 for x in self.model.pending if x.status=='failed')} FAILED")
-
-    def external_refresh(self):
-        if not self.applying and self.current_path and self.current_path.exists():self.render_items()
-
-    def run_search(self):
-        text=self.global_search.text().strip().lower()
-        if not text:return
-        self.results.clear(); roots=[resolve(r) for r in self.config.get("roots",[])]; w=Worker(self.search_worker,roots,text); w.signals.result.connect(self.show_search); w.signals.error.connect(lambda e:QMessageBox.warning(self,"Search failed",e)); self.pool.start(w)
-
+        for x in self.model.pending:self.queue.addItem(('🔴 ' if x.status=='failed' else '🟡 ')+x.label+(f' · {x.error}' if x.error else ''))
+        for x in reversed(self.model.history[-100:]):self.queue.addItem('🟢 '+x.label)
+    def search_go(self):
+        q=self.g.text().strip().lower();self.results.clear()
+        if not q:return
+        roots=[resolve(x) for x in self.c['roots']];w=Work(self.do_search,roots,q);w.s.result.connect(self.show_search);self.pool.start(w)
     @staticmethod
-    def search_worker(roots,text):
+    def do_search(roots,q):
         out=[]
-        for root in roots:
-            if not root.exists():continue
+        for r in roots:
             try:
-                for p in root.rglob("*"):
-                    if text in p.name.lower():out.append(str(p))
-                    if len(out)>=1500:return out
+                for p in r.rglob('*'):
+                    if q in p.name.lower():out.append(str(p))
+                    if len(out)>=2000:return out
             except OSError:pass
         return out
+    def show_search(self,arr):
+        for x in arr:
+            p=Path(x);it=QListWidgetItem(f'{icon(p)}  {p.name}  ·  {p.parent}');it.setData(Qt.UserRole,x);self.results.addItem(it)
+    def search_open(self,it):
+        p=resolve(it.data(Qt.UserRole));self.current=p if p.is_dir() else p.parent;self.pages.setCurrentIndex(0);self.render()
+    def closeEvent(self,e):
+        if self.model.pending and QMessageBox.question(self,'יש שינויים','יש שינויים שלא נשמרו. לצאת בלי לשמור?')!=QMessageBox.Yes:e.ignore();return
+        e.accept()
 
-    def show_search(self,results):
-        self.results.clear()
-        for raw in results:
-            p=Path(raw); it=QListWidgetItem(f"{p.name}  ·  {p.parent}"); it.setData(Qt.UserRole,raw); self.results.addItem(it)
-        self.sidebar_status.setText(f"FOUND · {len(results)}")
-
-    def open_search(self,item):
-        p=resolve(item.data(Qt.UserRole)); self.current_path=p if p.is_dir() else p.parent; self.pages.setCurrentIndex(0); self.render_items()
-
-    def closeEvent(self,event):
-        if self.model.pending and not self.applying:
-            if QMessageBox.question(self,"Unsaved changes","You have unsaved changes. Close without saving?")!=QMessageBox.Yes:event.ignore(); return
-        event.accept()
-
-
-STYLE=r'''
-*{font-family:"Segoe UI";} QWidget{background:#0b0d10;color:#edf1f5;font-size:14px;} #Sidebar{background:#0f1217;border-right:1px solid #222731;} #Brand{font-size:30px;font-weight:800;letter-spacing:-1px;} #PageTitle{font-size:34px;font-weight:750;letter-spacing:-1px;} #DialogTitle{font-size:25px;font-weight:700;} #SectionTitle{font-size:18px;font-weight:650;} #Eyebrow{color:#737d8a;font-size:11px;font-weight:800;letter-spacing:1px;} #Muted{color:#89929e;} #StatusPill{background:#171c23;border:1px solid #2b323c;border-radius:9px;padding:9px 12px;color:#a9b1bc;font-weight:700;} #NavButton{background:transparent;border:0;text-align:left;padding:12px 14px;border-radius:10px;color:#aeb6c1;} #NavButton:hover{background:#181d24;color:#fff;} QLineEdit,QComboBox{background:#11161c;border:1px solid #2a3038;border-radius:10px;padding:11px 12px;} QLineEdit:focus,QComboBox:focus{border:1px solid #667180;} QPushButton{background:#161b21;border:1px solid #2a3038;border-radius:10px;padding:10px 15px;font-weight:600;} QPushButton:hover{background:#20262d;} #Primary{background:#f1f4f7;color:#0a0c0f;border:0;font-weight:750;} #Primary:hover{background:#fff;} QListWidget{background:#0f1318;border:1px solid #242a33;border-radius:13px;padding:7px;} QListWidget::item{padding:13px;border-radius:9px;margin:2px 0;} QListWidget::item:hover{background:#171d24;} QListWidget::item:selected{background:#232a33;} #Panel{background:#11161c;border:1px solid #262d36;border-radius:14px;} #Thumb{background:#0b0d10;border:1px solid #282f38;border-radius:10px;color:#67717d;font-size:11px;font-weight:700;} #MediaTitle{font-size:19px;font-weight:700;} #StatCard{background:#11161c;border:1px solid #262d36;border-radius:13px;padding:14px 16px;font-weight:800;} QSplitter::handle{background:#1d232b;} QScrollBar:vertical{background:#0b0d10;width:10px;} QScrollBar::handle:vertical{background:#303741;border-radius:5px;min-height:30px;}
-'''
-
-
+STYLE='''*{font-family:"Segoe UI";} QWidget{background:#0a0d11;color:#eef2f6;font-size:14px;} #Sidebar{background:#0f1319;border-left:1px solid #252b34;} #Brand{font-size:31px;font-weight:800;} #PageTitle{font-size:35px;font-weight:800;} #DialogTitle{font-size:25px;font-weight:750;} #MediaTitle,#SectionTitle{font-size:19px;font-weight:700;} #Muted{color:#8993a0;} #StatusPill{background:#171d25;border:1px solid #2a323d;border-radius:10px;padding:10px;font-weight:700;} #NavButton{background:transparent;border:0;text-align:right;padding:13px;border-radius:10px;color:#aeb8c4;} #NavButton:hover{background:#1a2028;color:#fff;} QLineEdit,QComboBox{background:#11161d;border:1px solid #2b333e;border-radius:10px;padding:11px;} QPushButton{background:#161c23;border:1px solid #2b333e;border-radius:10px;padding:10px 15px;font-weight:650;} QPushButton:hover{background:#202730;} #Primary{background:#f2f5f8;color:#090b0e;border:0;} QListWidget{background:#10151b;border:1px solid #252c35;border-radius:13px;padding:7px;} QListWidget::item{padding:13px;border-radius:9px;} QListWidget::item:hover{background:#191f27;} QListWidget::item:selected{background:#242c36;} #Panel{background:#11171e;border:1px solid #29313b;border-radius:14px;} #Thumb{background:#0b0e12;border:1px solid #2a323c;border-radius:10px;color:#687381;} QProgressBar{background:#151b22;border:0;border-radius:7px;height:12px;text-align:center;} QProgressBar::chunk{background:#f2f5f8;border-radius:7px;}'''
 def main():
-    app=QApplication(sys.argv); app.setApplicationName(APP_NAME); app.setStyleSheet(STYLE); win=MainWindow(); win.show(); sys.exit(app.exec())
-
-if __name__=="__main__":main()
+    app=QApplication(sys.argv);app.setApplicationName(APP);app.setStyleSheet(STYLE);app.setLayoutDirection(Qt.RightToLeft);w=Main();w.show();sys.exit(app.exec())
+if __name__=='__main__':main()
