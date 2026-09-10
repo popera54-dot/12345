@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,15 +25,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      - name: Syntax check
+      - name: Compile source
         shell: pwsh
         run: |
-          python -m py_compile main.py launcher.py tunevault_engine.py
+          python -m py_compile app.py main.py launcher.py tunevault_engine.py tests/smoke_startup.py
 
-      - name: Runtime smoke test
+      - name: Real startup smoke test
         shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: |
-          python -c "import launcher; assert launcher.tunevault_main.QSplitter is launcher.QSplitter; print('Launcher smoke test: OK')"
+          python tests/smoke_startup.py
 
       - name: Build executable
         shell: pwsh
@@ -42,7 +44,7 @@ jobs:
             --collect-all imageio_ffmpeg `
             --collect-all PySide6 `
             --hidden-import=tunevault_engine `
-            launcher.py
+            app.py
 
       - name: Verify packaged files
         shell: pwsh
