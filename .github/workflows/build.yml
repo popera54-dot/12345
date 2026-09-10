@@ -28,7 +28,12 @@ jobs:
       - name: Syntax check
         shell: pwsh
         run: |
-          python -m py_compile main.py tunevault_engine.py
+          python -m py_compile main.py launcher.py tunevault_engine.py
+
+      - name: Runtime smoke test
+        shell: pwsh
+        run: |
+          python -c "import launcher; assert launcher.tunevault_main.QSplitter is launcher.QSplitter; print('Launcher smoke test: OK')"
 
       - name: Build executable
         shell: pwsh
@@ -37,7 +42,7 @@ jobs:
             --collect-all imageio_ffmpeg `
             --collect-all PySide6 `
             --hidden-import=tunevault_engine `
-            main.py
+            launcher.py
 
       - name: Verify packaged files
         shell: pwsh
